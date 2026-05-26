@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: catalyst-scanner
+    env: node
+    region: oregon
+    plan: free
+    buildCommand: npm install
+    startCommand: node server.js
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: TZ
+        value: America/New_York
+    disk:
+      name: data
+      mountPath: /opt/render/project/src
+      sizeGB: 1
