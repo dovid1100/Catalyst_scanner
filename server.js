@@ -1,3 +1,9 @@
+// ─────────────────────────────────────────────────────────────────────────────
+//  CATALYST SCANNER v3 — Rebuilt from scratch
+//  Data: Polygon.io (research) + Robinhood MCP (live prices)
+//  AI:   Claude (final judge)
+// ─────────────────────────────────────────────────────────────────────────────
+
 const express = require('express');
 const cors = require('cors');
 const cron = require('node-cron');
@@ -5,22 +11,36 @@ const fs = require('fs').promises;
 const path = require('path');
 const https = require('https');
 const http = require('http');
+const Anthropic = require('@anthropic-ai/sdk');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const DATA_FILE = path.join(__dirname, 'data.json');
 
+const POLYGON_KEY = process.env.POLYGON_API_KEY;
+const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+
 app.use(cors());
 app.use(express.json());
 
-// ─── Data Persistence ────────────────────────────────────────────────────────
+// ─── Logging ──────────────────────────────────────────────────────────────────
+
+function log(stage, message, data = null) {
+  const ts = new Date().toISOString();
+  const line = `[${ts}] [${stage}] ${message}`;
+  console.log(line);
+  if (data !== null) console.log(JSON.stringify(data, null, 2));
+  return line;
+}
+
+// ─── Data Persistence ─────────────────────────────────────────────────────────
 
 async function loadData() {
   try {
     const raw = await fs.readFile(DATA_FILE, 'utf8');
     return JSON.parse(raw);
   } catch {
-    return { signals: [], grades: [], scans: [] };
+    return { picks: [], scans: [], grades: [] };
   }
 }
 
@@ -28,624 +48,645 @@ async function saveData(data) {
   await fs.writeFile(DATA_FILE, JSON.stringify(data, null, 2));
 }
 
-// ─── HTTP Helpers ─────────────────────────────────────────────────────────────
+// ─── HTTP Helper ──────────────────────────────────────────────────────────────
 
-function fetchUrl(url, options = {}) {
+function fetchJSON(url, headers = {}) {
   return new Promise((resolve, reject) => {
     const lib = url.startsWith('https') ? https : http;
-    const req = lib.get(url, {
-      headers: {
-        'User-Agent': 'CatalystScanner/1.0 (research tool; contact@example.com)',
-        'Accept': 'application/json, text/html',
-        ...options.headers
-      },
-      timeout: 15000
-    }, (res) => {
+    const options = {
+      headers: { 'Accept': 'application/json', ...headers },
+      timeout: 20000
+    };
+    const req = lib.get(url, options, (res) => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-        return fetchUrl(res.headers.location, options).then(resolve).catch(reject);
+        return fetchJSON(res.headers.location, headers).then(resolve).catch(reject);
       }
-      let data = '';
-      res.on('data', chunk => data += chunk);
-      res.on('end', () => resolve({ status: res.statusCode, body: data }));
+      let body = '';
+      res.on('data', chunk => body += chunk);
+      res.on('end', () => {
+        try {
+          resolve({ status: res.statusCode, data: JSON.parse(body) });
+        } catch {
+          resolve({ status: res.statusCode, data: null, raw: body });
+        }
+      });
     });
     req.on('error', reject);
-    req.on('timeout', () => { req.destroy(); reject(new Error('Timeout')); });
+    req.on('timeout', () => { req.destroy(); reject(new Error('Request timeout')); });
   });
 }
 
-// ─── SEC EDGAR ────────────────────────────────────────────────────────────────
+// ─── STEP 1: Polygon Universe Fetch ──────────────────────────────────────────
+// Gets small-cap tickers from Polygon with volume and price data
 
-const POSITIVE_8K_KEYWORDS = [
-  'partnership', 'memorandum of understanding', 'MOU', 'financing', 'contract',
-  'acquisition', 'acquires', 'acquired', 'pivot', 'pivoting', 'new business',
-  'government grant', 'revenue', 'strategic alliance', 'letter of intent',
-  'LOI', 'collaboration agreement', 'distribution agreement', 'license agreement',
-  'reverse merger', 'change of business', 'new direction', 'rebranding'
-];
+async function getPolygonUniverse() {
+  log('POLYGON', 'Fetching small-cap universe...');
 
-const PIVOT_KEYWORDS = [
-  'reverse merger', 'change of business', 'new direction', 'acquired', 'pivoting to',
-  'change in control', 'name change', 'new management', 'strategic pivot'
-];
+  if (!POLYGON_KEY) {
+    log('POLYGON', 'ERROR: POLYGON_API_KEY not set');
+    return [];
+  }
 
-const COMPLIANCE_KEYWORDS = [
-  'minimum bid price', 'bid price requirement', 'compliance notice',
-  'deficiency notice', '$1.00 minimum', 'continued listing standards',
-  'transfer to', 'nasdaq deficiency', 'nyse deficiency'
-];
+  // Get previous trading day's gainers — stocks with unusual volume and price movement
+  const url = `https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/gainers?include_otc=false&apiKey=${POLYGON_KEY}`;
 
-async function searchEdgarFullText(query, dateFilter = null) {
   try {
-    const dateParam = dateFilter ? `&dateRange=custom&startdt=${dateFilter}&enddt=${new Date().toISOString().split('T')[0]}` : '';
-    const url = `https://efts.sec.gov/LATEST/search-index?q=%22${encodeURIComponent(query)}%22&dateRange=custom&startdt=${dateFilter || getYesterdayDate()}&enddt=${getTodayDate()}&forms=8-K,6-K`;
-    const res = await fetchUrl(url);
-    if (res.status !== 200) return [];
-    const data = JSON.parse(res.body);
-    return data.hits?.hits || [];
+    const res = await fetchJSON(url);
+    log('POLYGON', `Response status: ${res.status}`);
+
+    if (res.status !== 200 || !res.data) {
+      log('POLYGON', 'Bad response from Polygon gainers endpoint', res.data);
+      return [];
+    }
+
+    const tickers = res.data.tickers || [];
+    log('POLYGON', `Raw gainers returned: ${tickers.length}`);
+
+    if (tickers.length === 0) {
+      log('POLYGON', 'No tickers returned — trying previous close snapshot instead');
+      return await getPolygonPrevClose();
+    }
+
+    return tickers;
   } catch (e) {
-    console.error('EDGAR full text search error:', e.message);
+    log('POLYGON', `Fetch error: ${e.message}`);
     return [];
   }
 }
 
-async function searchEdgar8Ks() {
+async function getPolygonPrevClose() {
+  log('POLYGON', 'Fetching previous close snapshot...');
+  const date = getPrevTradingDay();
+  const url = `https://api.polygon.io/v2/aggs/grouped/locale/us/market/stocks/${date}?adjusted=true&apiKey=${POLYGON_KEY}`;
+
   try {
-    const today = getTodayDate();
-    const yesterday = getYesterdayDate();
-    const url = `https://efts.sec.gov/LATEST/search-index?forms=8-K,6-K&dateRange=custom&startdt=${yesterday}&enddt=${today}`;
-    const res = await fetchUrl(url);
-    if (res.status !== 200) return [];
-    const data = JSON.parse(res.body);
-    return data.hits?.hits || [];
+    const res = await fetchJSON(url);
+    log('POLYGON', `Prev close status: ${res.status}, results: ${res.data?.resultsCount || 0}`);
+
+    if (res.status !== 200 || !res.data?.results) return [];
+
+    // Return as ticker-like objects matching gainers shape
+    return res.data.results.map(r => ({
+      ticker: r.T,
+      day: { c: r.c, o: r.o, v: r.v, vw: r.vw },
+      prevDay: { c: r.c, v: r.v },
+      todaysChangePerc: ((r.c - r.o) / r.o) * 100,
+      todaysChange: r.c - r.o
+    }));
   } catch (e) {
-    console.error('EDGAR 8K search error:', e.message);
+    log('POLYGON', `Prev close error: ${e.message}`);
     return [];
   }
 }
 
-async function searchEdgar13D13G() {
-  try {
-    const today = getTodayDate();
-    const yesterday = getYesterdayDate();
-    const url = `https://efts.sec.gov/LATEST/search-index?forms=SC+13D,SC+13G,SC+13D%2FA,SC+13G%2FA&dateRange=custom&startdt=${yesterday}&enddt=${today}`;
-    const res = await fetchUrl(url);
-    if (res.status !== 200) return [];
-    const data = JSON.parse(res.body);
-    return data.hits?.hits || [];
-  } catch (e) {
-    console.error('EDGAR 13D/13G search error:', e.message);
-    return [];
-  }
-}
+// ─── STEP 2: Filter Universe ──────────────────────────────────────────────────
+// Wide net first — log every drop so we can see what's happening
 
-async function getCompanyInfo(cik) {
-  try {
-    const url = `https://data.sec.gov/submissions/CIK${String(cik).padStart(10, '0')}.json`;
-    const res = await fetchUrl(url);
-    if (res.status !== 200) return null;
-    return JSON.parse(res.body);
-  } catch (e) {
-    return null;
-  }
-}
+async function filterUniverse(tickers) {
+  log('FILTER', `Starting filter on ${tickers.length} tickers`);
 
-async function getFilingContent(accessionNumber, cik) {
-  try {
-    const acc = accessionNumber.replace(/-/g, '');
-    const url = `https://www.sec.gov/Archives/edgar/data/${cik}/${acc}/`;
-    const res = await fetchUrl(url);
-    return res.body || '';
-  } catch (e) {
-    return '';
-  }
-}
+  const results = [];
+  let dropped = { noPrice: 0, tooExpensive: 0, tooCheap: 0, noVolume: 0, passed: 0 };
 
-// ─── Yahoo Finance ────────────────────────────────────────────────────────────
+  for (const t of tickers) {
+    const ticker = t.ticker;
+    if (!ticker || ticker.includes('.') || ticker.includes('/')) continue;
 
-async function getStockData(ticker) {
-  try {
-    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${ticker}?interval=1d&range=30d`;
-    const res = await fetchUrl(url, {
-      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; CatalystScanner/1.0)' }
-    });
-    if (res.status !== 200) return null;
-    const data = JSON.parse(res.body);
-    const result = data?.chart?.result?.[0];
-    if (!result) return null;
+    const price = t.day?.c || t.lastTrade?.p || t.lastQuote?.P || 0;
+    const volume = t.day?.v || 0;
+    const changePerc = t.todaysChangePerc || 0;
 
-    const meta = result.meta;
-    const closes = result.indicators?.quote?.[0]?.close || [];
-    const volumes = result.indicators?.quote?.[0]?.volume || [];
+    // Drop if no price
+    if (!price || price <= 0) { dropped.noPrice++; continue; }
 
-    const validCloses = closes.filter(v => v != null);
-    const validVolumes = volumes.filter(v => v != null);
+    // Price range: $0.50 to $20 (small caps)
+    if (price < 0.50) { dropped.tooCheap++; continue; }
+    if (price > 20) { dropped.tooExpensive++; continue; }
 
-    const currentPrice = meta.regularMarketPrice || validCloses[validCloses.length - 1];
-    const currentVolume = meta.regularMarketVolume || validVolumes[validVolumes.length - 1];
+    // Minimum volume: 100k shares (very loose)
+    if (volume < 100000) { dropped.noVolume++; continue; }
 
-    const last20Volumes = validVolumes.slice(-20);
-    const avgVolume = last20Volumes.length > 0
-      ? last20Volumes.reduce((a, b) => a + b, 0) / last20Volumes.length
-      : 0;
-
-    const volumeRatio = avgVolume > 0 ? currentVolume / avgVolume : 0;
-
-    return {
+    dropped.passed++;
+    results.push({
       ticker,
-      price: currentPrice,
-      volume: currentVolume,
-      avgVolume: Math.round(avgVolume),
-      volumeRatio: Math.round(volumeRatio * 100) / 100,
-      marketCap: meta.marketCap || null,
-      sharesOutstanding: meta.sharesOutstanding || null,
-      currency: meta.currency || 'USD'
-    };
-  } catch (e) {
-    console.error(`Yahoo Finance error for ${ticker}:`, e.message);
-    return null;
-  }
-}
-
-async function getStockSummary(ticker) {
-  try {
-    const url = `https://query1.finance.yahoo.com/v10/finance/quoteSummary/${ticker}?modules=defaultKeyStatistics,summaryDetail,price`;
-    const res = await fetchUrl(url, {
-      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; CatalystScanner/1.0)' }
+      price,
+      volume,
+      changePerc: Math.round(changePerc * 100) / 100,
+      change: t.todaysChange || 0
     });
-    if (res.status !== 200) return null;
-    const data = JSON.parse(res.body);
-    const result = data?.quoteSummary?.result?.[0];
-    if (!result) return null;
-
-    const stats = result.defaultKeyStatistics || {};
-    const summary = result.summaryDetail || {};
-    const price = result.price || {};
-
-    const marketCap = price.marketCap?.raw || summary.marketCap?.raw || null;
-    const sharesFloat = stats.floatShares?.raw || null;
-    const sharesOutstanding = stats.sharesOutstanding?.raw || null;
-
-    return {
-      ticker,
-      marketCap,
-      sharesFloat,
-      sharesOutstanding,
-      exchange: price.exchangeName || price.exchange || null,
-      companyName: price.longName || price.shortName || ticker
-    };
-  } catch (e) {
-    console.error(`Yahoo Finance summary error for ${ticker}:`, e.message);
-    return null;
   }
+
+  log('FILTER', `Filter results:`, dropped);
+  log('FILTER', `Passed filter: ${results.length} tickers`);
+
+  // Sort by volume descending, take top 50 for enrichment
+  results.sort((a, b) => b.volume - a.volume);
+  const top = results.slice(0, 50);
+  log('FILTER', `Taking top ${top.length} by volume for enrichment`);
+
+  return top;
 }
 
-// ─── Signal Scoring ───────────────────────────────────────────────────────────
+// ─── STEP 3: Polygon Enrichment ───────────────────────────────────────────────
+// Get detailed data for each filtered ticker
 
-function scoreSignal(signals) {
-  let score = 0;
-  const reasons = [];
+async function enrichWithPolygon(tickers) {
+  log('ENRICH', `Enriching ${tickers.length} tickers with Polygon details`);
+  const enriched = [];
 
-  if (signals.nearCompliance) { score += 30; reasons.push('Near $1 compliance deadline (+30)'); }
-  if (signals.positive8K) { score += 25; reasons.push('Positive 8-K filed today (+25)'); }
-  if (signals.lowFloat) { score += 20; reasons.push('Low float under 10M shares (+20)'); }
-  if (signals.volumeSpike) { score += 15; reasons.push('Volume spiking 2x+ (+15)'); }
-  if (signals.stake13D) { score += 10; reasons.push('13D/13G stake filing (+10)'); }
+  for (const t of tickers) {
+    try {
+      // Get ticker details (market cap, description, etc)
+      const detailUrl = `https://api.polygon.io/v3/reference/tickers/${t.ticker}?apiKey=${POLYGON_KEY}`;
+      const detailRes = await fetchJSON(detailUrl);
 
-  return { score, reasons };
-}
+      if (detailRes.status !== 200 || !detailRes.data?.results) {
+        log('ENRICH', `No detail for ${t.ticker}, skipping`);
+        continue;
+      }
 
-function classifyUrgency(score, volumeRatio) {
-  if (score >= 70 || (score >= 60 && volumeRatio >= 2)) return 'URGENT';
-  if (score >= 60) return 'UPCOMING';
-  return 'WATCHING';
-}
+      const detail = detailRes.data.results;
+      const marketCap = detail.market_cap || 0;
 
-function detectPositive8KLanguage(text) {
-  if (!text) return { found: false, keywords: [] };
-  const lower = text.toLowerCase();
-  const found = POSITIVE_8K_KEYWORDS.filter(kw => lower.includes(kw.toLowerCase()));
-  return { found: found.length > 0, keywords: found };
-}
+      // Market cap filter: under $300M (small cap)
+      // Log what we're dropping and why
+      if (marketCap > 300_000_000) {
+        log('ENRICH', `${t.ticker} dropped: market cap $${(marketCap/1e6).toFixed(0)}M > $300M`);
+        continue;
+      }
 
-function detectPivotLanguage(text) {
-  if (!text) return false;
-  const lower = text.toLowerCase();
-  return PIVOT_KEYWORDS.some(kw => lower.includes(kw.toLowerCase()));
-}
+      // Get 30-day volume history for avg volume calculation
+      const toDate = getTodayDate();
+      const fromDate = getDateDaysAgo(30);
+      const aggUrl = `https://api.polygon.io/v2/aggs/ticker/${t.ticker}/range/1/day/${fromDate}/${toDate}?adjusted=true&sort=asc&limit=30&apiKey=${POLYGON_KEY}`;
+      const aggRes = await fetchJSON(aggUrl);
 
-function detectComplianceLanguage(text) {
-  if (!text) return false;
-  const lower = text.toLowerCase();
-  return COMPLIANCE_KEYWORDS.some(kw => lower.includes(kw.toLowerCase()));
-}
+      let avgVolume = 0;
+      let volumeRatio = 0;
+      let recentPrices = [];
 
-// ─── AI Analysis via Claude ───────────────────────────────────────────────────
+      if (aggRes.status === 200 && aggRes.data?.results?.length > 0) {
+        const bars = aggRes.data.results;
+        const vols = bars.map(b => b.v).filter(v => v > 0);
+        avgVolume = vols.length > 0 ? vols.reduce((a, b) => a + b, 0) / vols.length : 0;
+        volumeRatio = avgVolume > 0 ? t.volume / avgVolume : 0;
+        recentPrices = bars.slice(-10).map(b => b.c);
+      }
 
-async function analyzeFilingWithClaude(filingText, ticker, filingType) {
-  try {
-    const Anthropic = require('@anthropic-ai/sdk');
-    const client = new Anthropic();
+      // Get recent news from Polygon
+      const newsUrl = `https://api.polygon.io/v2/reference/news?ticker=${t.ticker}&limit=5&apiKey=${POLYGON_KEY}`;
+      const newsRes = await fetchJSON(newsUrl);
+      const news = newsRes.data?.results || [];
 
-    const truncated = filingText.substring(0, 3000);
+      enriched.push({
+        ...t,
+        marketCap,
+        companyName: detail.name || t.ticker,
+        description: detail.description || '',
+        sic: detail.sic_description || '',
+        listingDate: detail.list_date || '',
+        avgVolume: Math.round(avgVolume),
+        volumeRatio: Math.round(volumeRatio * 100) / 100,
+        recentPrices,
+        news: news.map(n => ({
+          title: n.title,
+          published: n.published_utc,
+          summary: n.description || ''
+        })),
+        exchange: detail.primary_exchange || '',
+        shareClassSharesOutstanding: detail.share_class_shares_outstanding || 0,
+        weightedSharesOutstanding: detail.weighted_shares_outstanding || 0
+      });
 
-    const message = await client.messages.create({
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 500,
-      messages: [{
-        role: 'user',
-        content: `You are a micro-cap stock analyst. Analyze this ${filingType} filing for ticker ${ticker} and extract key information.
+      log('ENRICH', `✓ ${t.ticker} — $${t.price} — Vol ratio: ${volumeRatio.toFixed(1)}x — MCap: $${(marketCap/1e6).toFixed(0)}M`);
 
-Filing excerpt:
-${truncated}
+      // Rate limit: Polygon Starter allows 5 calls/min
+      await sleep(250);
 
-Respond with ONLY a JSON object (no markdown) with these fields:
-{
-  "summary": "1-2 sentence plain English summary of what this filing says",
-  "catalystType": "one of: partnership, financing, acquisition, pivot, compliance, stake, revenue, other",
-  "sentiment": "positive, negative, or neutral",
-  "keyFinding": "the single most important thing this filing reveals",
-  "riskNote": "main risk or concern for traders"
-}`
-      }]
-    });
-
-    const text = message.content[0]?.text || '{}';
-    const clean = text.replace(/```json|```/g, '').trim();
-    return JSON.parse(clean);
-  } catch (e) {
-    console.error('Claude analysis error:', e.message);
-    return {
-      summary: 'Filing detected — manual review recommended',
-      catalystType: 'other',
-      sentiment: 'neutral',
-      keyFinding: 'Unable to auto-analyze',
-      riskNote: 'Verify filing details manually'
-    };
+    } catch (e) {
+      log('ENRICH', `Error enriching ${t.ticker}: ${e.message}`);
+    }
   }
+
+  log('ENRICH', `Enrichment complete: ${enriched.length} stocks ready for Claude`);
+  return enriched;
 }
 
-// ─── Main Scanner ─────────────────────────────────────────────────────────────
+// ─── STEP 4: SEC EDGAR Catalyst Check ────────────────────────────────────────
+// Check if any enriched stocks have recent filings
 
-async function runScan() {
-  console.log(`[${new Date().toISOString()}] Starting scan...`);
-  const data = await loadData();
-  const newSignals = [];
-  const scanRecord = { timestamp: new Date().toISOString(), found: 0, errors: [] };
+async function checkEdgarCatalysts(tickers) {
+  log('EDGAR', `Checking EDGAR for ${tickers.length} tickers`);
+  const withCatalysts = [];
 
-  try {
-    // --- Signal 1 & 4: 8-K / 6-K Filings ---
-    const recentFilings = await searchEdgar8Ks();
-    console.log(`Found ${recentFilings.length} recent 8K/6K filings`);
+  for (const t of tickers) {
+    try {
+      // Search EDGAR full text for this ticker
+      const query = t.ticker;
+      const fromDate = getDateDaysAgo(3);
+      const toDate = getTodayDate();
+      const url = `https://efts.sec.gov/LATEST/search-index?q=%22${query}%22&dateRange=custom&startdt=${fromDate}&enddt=${toDate}&forms=8-K,6-K,SC+13D,SC+13G`;
 
-    for (const filing of recentFilings.slice(0, 30)) {
-      try {
-        const source = filing._source || {};
-        const ticker = source.period_of_report || source.file_num || null;
-        const cik = source.entity_id || source.cik || null;
-        const entityName = source.display_names?.[0]?.name || source.entity_name || 'Unknown';
-        const filingDate = source.period_of_report || source.file_date || '';
-        const formType = source.form_type || '8-K';
+      const res = await fetchJSON(url, {
+        'User-Agent': 'CatalystScanner research@example.com'
+      });
 
-        if (!ticker && !cik) continue;
+      const hits = res.data?.hits?.hits || [];
+      const catalysts = [];
 
-        // Get company submissions to find ticker
-        let actualTicker = null;
-        if (cik) {
-          const companyInfo = await getCompanyInfo(cik);
-          actualTicker = companyInfo?.tickers?.[0] || null;
+      for (const hit of hits.slice(0, 3)) {
+        const src = hit._source || {};
+        const formType = src.form_type || '';
+        const filingDate = src.file_date || src.period_of_report || '';
+        const entityName = src.display_names?.[0]?.name || '';
+
+        // Try to get actual filing text
+        const accession = src.accession_no || '';
+        const cik = src.entity_id || '';
+        let filingText = src.period_of_report || '';
+
+        if (accession && cik) {
+          try {
+            const acc = accession.replace(/-/g, '');
+            const indexUrl = `https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK=${cik}&type=${formType}&dateb=&owner=include&count=5&search_text=`;
+            // Use the filing index to find the actual document
+            const txtUrl = `https://www.sec.gov/Archives/edgar/data/${cik}/${acc}/${accession}.txt`;
+            const txtRes = await fetchJSON(txtUrl, { 'User-Agent': 'CatalystScanner research@example.com' });
+            if (txtRes.raw) filingText = txtRes.raw.substring(0, 2000);
+          } catch { /* use what we have */ }
         }
 
-        if (!actualTicker) continue;
-
-        // Get stock data
-        const stockData = await getStockData(actualTicker);
-        const stockSummary = await getStockSummary(actualTicker);
-
-        if (!stockData || !stockSummary) continue;
-
-        // Filter: must be micro-cap under $100M
-        const marketCap = stockSummary.marketCap || stockData.marketCap || 0;
-        if (marketCap > 100_000_000 || marketCap === 0) continue;
-
-        // Filter: Nasdaq or NYSE only
-        const exchange = stockSummary.exchange || '';
-        if (!exchange.toLowerCase().includes('nasdaq') && !exchange.toLowerCase().includes('nyse') && !['NMS', 'NGM', 'NCM', 'NYQ', 'ASE'].includes(exchange)) continue;
-
-        // Get filing text for analysis
-        const filingText = source.file_description || source.period_of_report || '';
-        const positiveLang = detectPositive8KLanguage(filingText);
-        const isPivot = detectPivotLanguage(filingText);
-        const isCompliance = detectComplianceLanguage(filingText);
-
-        if (!positiveLang.found && !isPivot && !isCompliance) continue;
-
-        const float = stockSummary.sharesFloat || 0;
-        const signals = {
-          nearCompliance: isCompliance || stockData.price < 1.2,
-          positive8K: positiveLang.found,
-          lowFloat: float > 0 && float < 10_000_000,
-          volumeSpike: stockData.volumeRatio >= 2,
-          stake13D: false,
-          isPivot
-        };
-
-        const { score, reasons } = scoreSignal(signals);
-        if (score < 40) continue;
-
-        // AI analysis
-        const aiAnalysis = await analyzeFilingWithClaude(
-          filingText + ' ' + (source.period_of_report || ''),
-          actualTicker,
-          formType
-        );
-
-        const urgency = classifyUrgency(score, stockData.volumeRatio);
-        const entryNote = stockData.volumeRatio >= 2
-          ? 'Volume already moving — enter carefully, spread may be wide'
-          : stockData.price < 1.2
-            ? 'Watch for morning gap above $1 — compliance plays often open volatile'
-            : 'Monitor pre-market — ideal entry on first pull-back after open';
-
-        const signal = {
-          id: `${actualTicker}-${Date.now()}`,
-          ticker: actualTicker,
-          companyName: stockSummary.companyName || entityName,
-          marketCap,
-          float,
-          filingType: formType,
+        catalysts.push({
+          formType,
           filingDate,
-          filingDescription: aiAnalysis.summary,
-          keyFinding: aiAnalysis.keyFinding,
-          catalystType: aiAnalysis.catalystType,
-          confidenceScore: score,
-          scoreReasons: reasons,
-          triggeredSignals: Object.entries(signals).filter(([, v]) => v).map(([k]) => k),
-          currentPrice: stockData.price,
-          volume: stockData.volume,
-          avgVolume: stockData.avgVolume,
-          volumeRatio: stockData.volumeRatio,
-          urgency,
-          entryNote,
-          riskNote: aiAnalysis.riskNote,
-          entryPrice: stockData.price,
-          flaggedAt: new Date().toISOString(),
-          graded: false,
-          outcome: null
-        };
-
-        newSignals.push(signal);
-        scanRecord.found++;
-        console.log(`Flagged: ${actualTicker} — Score: ${score} — ${urgency}`);
-      } catch (e) {
-        console.error('Error processing filing:', e.message);
-        scanRecord.errors.push(e.message);
+          entityName,
+          filingText: filingText.substring(0, 1000),
+          accession
+        });
       }
-    }
 
-    // --- Signal 3: 13D/13G Stake Filings ---
-    const stakeFilings = await searchEdgar13D13G();
-    console.log(`Found ${stakeFilings.length} stake filings`);
+      withCatalysts.push({ ...t, catalysts });
 
-    for (const filing of stakeFilings.slice(0, 20)) {
-      try {
-        const source = filing._source || {};
-        const cik = source.entity_id || source.cik || null;
-        if (!cik) continue;
-
-        const companyInfo = await getCompanyInfo(cik);
-        const actualTicker = companyInfo?.tickers?.[0] || null;
-        if (!actualTicker) continue;
-
-        const stockData = await getStockData(actualTicker);
-        const stockSummary = await getStockSummary(actualTicker);
-        if (!stockData || !stockSummary) continue;
-
-        const marketCap = stockSummary.marketCap || stockData.marketCap || 0;
-        if (marketCap > 100_000_000 || marketCap === 0) continue;
-
-        const exchange = stockSummary.exchange || '';
-        if (!exchange.toLowerCase().includes('nasdaq') && !exchange.toLowerCase().includes('nyse') && !['NMS', 'NGM', 'NCM', 'NYQ', 'ASE'].includes(exchange)) continue;
-
-        const float = stockSummary.sharesFloat || 0;
-        const signals = {
-          nearCompliance: stockData.price < 1.2,
-          positive8K: false,
-          lowFloat: float > 0 && float < 10_000_000,
-          volumeSpike: stockData.volumeRatio >= 2,
-          stake13D: true
-        };
-
-        const { score, reasons } = scoreSignal(signals);
-        if (score < 40) continue;
-
-        const aiAnalysis = await analyzeFilingWithClaude(
-          `13D/13G stake filing for ${actualTicker}. ${source.display_names?.[0]?.name || ''} — investor acquired 5%+ stake.`,
-          actualTicker,
-          source.form_type || 'SC 13D'
-        );
-
-        const urgency = classifyUrgency(score, stockData.volumeRatio);
-
-        const signal = {
-          id: `${actualTicker}-13D-${Date.now()}`,
-          ticker: actualTicker,
-          companyName: stockSummary.companyName || source.display_names?.[0]?.name || actualTicker,
-          marketCap,
-          float,
-          filingType: source.form_type || 'SC 13D',
-          filingDate: source.period_of_report || source.file_date || '',
-          filingDescription: aiAnalysis.summary,
-          keyFinding: aiAnalysis.keyFinding,
-          catalystType: 'stake',
-          confidenceScore: score,
-          scoreReasons: reasons,
-          triggeredSignals: ['stake13D', ...Object.entries(signals).filter(([k, v]) => k !== 'stake13D' && v).map(([k]) => k)],
-          currentPrice: stockData.price,
-          volume: stockData.volume,
-          avgVolume: stockData.avgVolume,
-          volumeRatio: stockData.volumeRatio,
-          urgency,
-          entryNote: 'Stake filings often precede buyout offers — monitor for follow-on filings',
-          riskNote: aiAnalysis.riskNote,
-          entryPrice: stockData.price,
-          flaggedAt: new Date().toISOString(),
-          graded: false,
-          outcome: null
-        };
-
-        newSignals.push(signal);
-        scanRecord.found++;
-        console.log(`Stake flagged: ${actualTicker} — Score: ${score}`);
-      } catch (e) {
-        console.error('Error processing stake filing:', e.message);
+      if (catalysts.length > 0) {
+        log('EDGAR', `${t.ticker}: ${catalysts.length} recent filing(s) found`);
       }
-    }
 
-  } catch (e) {
-    console.error('Scan error:', e.message);
-    scanRecord.errors.push(e.message);
+      await sleep(200);
+    } catch (e) {
+      log('EDGAR', `Error checking ${t.ticker}: ${e.message}`);
+      withCatalysts.push({ ...t, catalysts: [] });
+    }
   }
 
-  // Deduplicate: don't re-add same ticker if already flagged in last 12 hours
-  const twelveHoursAgo = Date.now() - 12 * 60 * 60 * 1000;
-  const recentTickers = new Set(
-    data.signals
-      .filter(s => new Date(s.flaggedAt).getTime() > twelveHoursAgo)
-      .map(s => s.ticker)
-  );
+  return withCatalysts;
+}
 
-  const uniqueNewSignals = newSignals.filter(s => !recentTickers.has(s.ticker));
+// ─── STEP 5: Claude Final Analysis ───────────────────────────────────────────
+// Claude gets ALL the data and picks the best 3
 
-  data.signals = [...uniqueNewSignals, ...data.signals];
-  data.scans = [scanRecord, ...(data.scans || [])].slice(0, 100);
+async function claudePickTopStocks(stocks) {
+  log('CLAUDE', `Sending ${stocks.length} stocks to Claude for analysis`);
 
+  if (stocks.length === 0) {
+    log('CLAUDE', 'No stocks to analyze');
+    return [];
+  }
+
+  // Build the data payload for Claude
+  const stockData = stocks.map(s => ({
+    ticker: s.ticker,
+    company: s.companyName,
+    price: s.price,
+    priceChange: `${s.changePerc > 0 ? '+' : ''}${s.changePerc}%`,
+    volume: s.volume,
+    avgVolume: s.avgVolume,
+    volumeRatio: `${s.volumeRatio}x average`,
+    marketCap: s.marketCap ? `$${(s.marketCap / 1e6).toFixed(1)}M` : 'unknown',
+    float: s.weightedSharesOutstanding ? `${(s.weightedSharesOutstanding / 1e6).toFixed(1)}M shares` : 'unknown',
+    sector: s.sic || 'unknown',
+    recentPrices: s.recentPrices?.slice(-5).join(', ') || 'no data',
+    recentNews: s.news?.slice(0, 2).map(n => n.title).join(' | ') || 'no news',
+    recentFilings: s.catalysts?.map(c => `${c.formType} on ${c.filingDate}`).join(', ') || 'none',
+    filingDetails: s.catalysts?.[0]?.filingText?.substring(0, 300) || ''
+  }));
+
+  const prompt = `You are an expert small-cap stock trader. Your job is to identify stocks most likely to make a 20%+ move within the next 3-5 trading days.
+
+Here are today's candidates with full data:
+
+${JSON.stringify(stockData, null, 2)}
+
+Your task:
+1. Analyze each stock carefully
+2. Look for: unusual volume spikes, recent catalysts (news/filings), low float (easier to move), price patterns, sector momentum
+3. Pick the TOP 3 stocks you genuinely believe have the highest probability of a 20%+ move
+4. If fewer than 3 are genuinely compelling, pick fewer — do NOT pick stocks just to fill the list
+5. Be specific about WHY each pick could move
+
+Respond ONLY with a valid JSON array (no markdown, no explanation outside the JSON):
+[
+  {
+    "ticker": "XXXX",
+    "companyName": "Company Name",
+    "currentPrice": 1.23,
+    "catalystSummary": "Clear 1-2 sentence explanation of the specific catalyst",
+    "whyItWillMove": "Specific reasoning — what's the trigger, who's buying, what's the setup",
+    "keyRisk": "Main thing that could go wrong",
+    "targetMove": "estimated % move if catalyst plays out",
+    "urgency": "TODAY or THIS_WEEK",
+    "confidenceScore": 75
+  }
+]
+
+If no stocks meet the bar for a genuine 20%+ setup, return an empty array: []`;
+
+  try {
+    const message = await anthropic.messages.create({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 2000,
+      messages: [{ role: 'user', content: prompt }]
+    });
+
+    const text = message.content[0]?.text || '[]';
+    log('CLAUDE', 'Response received, parsing...');
+
+    // Clean and parse
+    const clean = text.replace(/```json|```/g, '').trim();
+    const picks = JSON.parse(clean);
+
+    log('CLAUDE', `Claude selected ${picks.length} picks`);
+    picks.forEach(p => log('CLAUDE', `  → ${p.ticker} (${p.confidenceScore}% confidence): ${p.catalystSummary}`));
+
+    return picks;
+  } catch (e) {
+    log('CLAUDE', `Error: ${e.message}`);
+    return [];
+  }
+}
+
+// ─── Main Scan Runner ─────────────────────────────────────────────────────────
+
+async function runScan() {
+  const scanStart = new Date().toISOString();
+  log('SCAN', '═══════════════════════════════════════');
+  log('SCAN', `Starting scan at ${scanStart}`);
+  log('SCAN', '═══════════════════════════════════════');
+
+  const scanRecord = {
+    startedAt: scanStart,
+    completedAt: null,
+    steps: {},
+    picksFound: 0,
+    error: null
+  };
+
+  try {
+    // STEP 1: Get universe from Polygon
+    const universe = await getPolygonUniverse();
+    scanRecord.steps.universeSize = universe.length;
+    log('SCAN', `Step 1 complete: ${universe.length} stocks in universe`);
+
+    if (universe.length === 0) {
+      log('SCAN', 'PROBLEM: Universe is empty. Check POLYGON_API_KEY and market hours.');
+      scanRecord.error = 'Empty universe from Polygon';
+      await saveScanRecord(scanRecord);
+      return [];
+    }
+
+    // STEP 2: Filter
+    const filtered = await filterUniverse(universe);
+    scanRecord.steps.afterFilter = filtered.length;
+    log('SCAN', `Step 2 complete: ${filtered.length} stocks after filter`);
+
+    if (filtered.length === 0) {
+      log('SCAN', 'PROBLEM: All stocks dropped by filter. Filters may be too strict.');
+      scanRecord.error = 'All stocks dropped by filter';
+      await saveScanRecord(scanRecord);
+      return [];
+    }
+
+    // STEP 3: Enrich with Polygon details
+    const enriched = await enrichWithPolygon(filtered);
+    scanRecord.steps.afterEnrichment = enriched.length;
+    log('SCAN', `Step 3 complete: ${enriched.length} stocks enriched`);
+
+    if (enriched.length === 0) {
+      log('SCAN', 'PROBLEM: No stocks survived enrichment. Market cap filter may be too strict.');
+      scanRecord.error = 'No stocks survived enrichment';
+      await saveScanRecord(scanRecord);
+      return [];
+    }
+
+    // STEP 4: Check EDGAR for catalysts
+    const withCatalysts = await checkEdgarCatalysts(enriched);
+    scanRecord.steps.withCatalysts = withCatalysts.filter(s => s.catalysts?.length > 0).length;
+    log('SCAN', `Step 4 complete: ${scanRecord.steps.withCatalysts} stocks have recent filings`);
+
+    // STEP 5: Claude picks top 3
+    const picks = await claudePickTopStocks(withCatalysts);
+    scanRecord.steps.claudePicks = picks.length;
+    log('SCAN', `Step 5 complete: Claude made ${picks.length} picks`);
+
+    // Save picks
+    const data = await loadData();
+    const finalPicks = picks.map(p => ({
+      id: `${p.ticker}-${Date.now()}`,
+      ...p,
+      flaggedAt: new Date().toISOString(),
+      entryPrice: p.currentPrice,
+      graded: false,
+      outcome: null
+    }));
+
+    data.picks = [...finalPicks, ...data.picks].slice(0, 500);
+    scanRecord.completedAt = new Date().toISOString();
+    scanRecord.picksFound = finalPicks.length;
+    data.scans = [scanRecord, ...(data.scans || [])].slice(0, 100);
+    await saveData(data);
+
+    log('SCAN', '═══════════════════════════════════════');
+    log('SCAN', `Scan complete. ${finalPicks.length} picks saved.`);
+    log('SCAN', '═══════════════════════════════════════');
+
+    return finalPicks;
+
+  } catch (e) {
+    log('SCAN', `FATAL ERROR: ${e.message}`);
+    scanRecord.error = e.message;
+    scanRecord.completedAt = new Date().toISOString();
+    await saveScanRecord(scanRecord);
+    return [];
+  }
+}
+
+async function saveScanRecord(record) {
+  const data = await loadData();
+  data.scans = [record, ...(data.scans || [])].slice(0, 100);
   await saveData(data);
-  console.log(`[${new Date().toISOString()}] Scan complete. ${uniqueNewSignals.length} new signals added.`);
-  return uniqueNewSignals;
 }
 
-// ─── Date Helpers ─────────────────────────────────────────────────────────────
+// ─── Diagnostic Endpoint ──────────────────────────────────────────────────────
+// Run each step individually to find where things break
 
-function getTodayDate() {
-  return new Date().toISOString().split('T')[0];
-}
+app.get('/api/diagnose', async (req, res) => {
+  log('DIAGNOSE', 'Running diagnostic...');
+  const report = {};
 
-function getYesterdayDate() {
-  const d = new Date();
-  d.setDate(d.getDate() - 1);
-  return d.toISOString().split('T')[0];
-}
+  // Check env vars
+  report.env = {
+    POLYGON_KEY: POLYGON_KEY ? `set (${POLYGON_KEY.substring(0, 4)}...)` : 'MISSING',
+    ANTHROPIC_KEY: process.env.ANTHROPIC_API_KEY ? 'set' : 'MISSING'
+  };
 
-// ─── Scheduled Scans ─────────────────────────────────────────────────────────
-// Weekdays only: 6AM, 9:25AM, 4:30PM, 8PM EST (UTC offsets handled by server TZ)
+  // Test Polygon connection
+  try {
+    const url = `https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/gainers?include_otc=false&apiKey=${POLYGON_KEY}`;
+    const r = await fetchJSON(url);
+    report.polygon = {
+      status: r.status,
+      tickersReturned: r.data?.tickers?.length || 0,
+      sample: r.data?.tickers?.slice(0, 3).map(t => t.ticker) || [],
+      error: r.data?.error || null
+    };
+  } catch (e) {
+    report.polygon = { error: e.message };
+  }
 
-cron.schedule('0 6 * * 1-5', () => { console.log('6:00 AM scan'); runScan(); }, { timezone: 'America/New_York' });
-cron.schedule('25 9 * * 1-5', () => { console.log('9:25 AM scan'); runScan(); }, { timezone: 'America/New_York' });
-cron.schedule('30 16 * * 1-5', () => { console.log('4:30 PM scan'); runScan(); }, { timezone: 'America/New_York' });
-cron.schedule('0 20 * * 1-5', () => { console.log('8:00 PM scan'); runScan(); }, { timezone: 'America/New_York' });
+  // Test EDGAR
+  try {
+    const url = `https://efts.sec.gov/LATEST/search-index?forms=8-K&dateRange=custom&startdt=${getDateDaysAgo(1)}&enddt=${getTodayDate()}`;
+    const r = await fetchJSON(url, { 'User-Agent': 'CatalystScanner research@example.com' });
+    report.edgar = {
+      status: r.status,
+      hitsReturned: r.data?.hits?.hits?.length || 0
+    };
+  } catch (e) {
+    report.edgar = { error: e.message };
+  }
+
+  // Test Claude
+  try {
+    const msg = await anthropic.messages.create({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 50,
+      messages: [{ role: 'user', content: 'Reply with: OK' }]
+    });
+    report.claude = { status: 'connected', response: msg.content[0]?.text };
+  } catch (e) {
+    report.claude = { error: e.message };
+  }
+
+  res.json(report);
+});
 
 // ─── API Routes ───────────────────────────────────────────────────────────────
 
-// GET all signals (with optional filters)
-app.get('/api/signals', async (req, res) => {
+// Health check
+app.get('/', (req, res) => res.json({
+  status: 'Catalyst Scanner v3 running',
+  time: new Date().toISOString(),
+  schedules: ['9:00 AM EST (weekdays)', '9:00 PM EST (weekdays)']
+}));
+
+// Get all picks
+app.get('/api/picks', async (req, res) => {
   try {
     const data = await loadData();
-    let signals = data.signals || [];
-
-    const { urgency, ticker, catalyst, graded, limit = 100 } = req.query;
-    if (urgency) signals = signals.filter(s => s.urgency === urgency.toUpperCase());
-    if (ticker) signals = signals.filter(s => s.ticker.toUpperCase().includes(ticker.toUpperCase()));
-    if (catalyst) signals = signals.filter(s => s.catalystType === catalyst);
-    if (graded === 'true') signals = signals.filter(s => s.graded);
-    if (graded === 'false') signals = signals.filter(s => !s.graded);
-
-    signals = signals.slice(0, parseInt(limit));
-    res.json({ success: true, count: signals.length, signals });
+    let picks = data.picks || [];
+    const { limit = 50, ticker, graded } = req.query;
+    if (ticker) picks = picks.filter(p => p.ticker?.toUpperCase().includes(ticker.toUpperCase()));
+    if (graded === 'true') picks = picks.filter(p => p.graded);
+    if (graded === 'false') picks = picks.filter(p => !p.graded);
+    picks = picks.slice(0, parseInt(limit));
+    res.json({ success: true, count: picks.length, picks });
   } catch (e) {
     res.status(500).json({ success: false, error: e.message });
   }
 });
 
-// POST manual trigger scan
+// Manual scan trigger
 app.post('/api/scan', async (req, res) => {
+  log('SCAN', 'Manual scan triggered via API');
+  res.json({ success: true, message: 'Scan started' });
+  runScan().catch(e => log('SCAN', `Background scan error: ${e.message}`));
+});
+
+// Get last scan status
+app.get('/api/status', async (req, res) => {
   try {
-    res.json({ success: true, message: 'Scan started in background' });
-    runScan().catch(console.error);
+    const data = await loadData();
+    const lastScan = (data.scans || [])[0] || null;
+    res.json({
+      success: true,
+      lastScan,
+      totalPicks: (data.picks || []).length,
+      recentPicks: (data.picks || []).slice(0, 5).map(p => ({
+        ticker: p.ticker,
+        flaggedAt: p.flaggedAt,
+        confidence: p.confidenceScore
+      }))
+    });
   } catch (e) {
     res.status(500).json({ success: false, error: e.message });
   }
 });
 
-// POST grade a signal
+// Get scan logs
+app.get('/api/logs', async (req, res) => {
+  try {
+    const data = await loadData();
+    res.json({ success: true, scans: (data.scans || []).slice(0, 20) });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// Grade a pick
 app.post('/api/grade/:id', async (req, res) => {
   try {
     const { id } = req.params;
     const { exitPrice, notes } = req.body;
     const data = await loadData();
+    const pick = data.picks.find(p => p.id === id);
+    if (!pick) return res.status(404).json({ success: false, error: 'Pick not found' });
 
-    const signal = data.signals.find(s => s.id === id);
-    if (!signal) return res.status(404).json({ success: false, error: 'Signal not found' });
-
-    const movePercent = ((exitPrice - signal.entryPrice) / signal.entryPrice) * 100;
-    const pnl = (movePercent / 100) * 1000; // $1000 per trade
-
-    signal.graded = true;
-    signal.outcome = {
+    const movePercent = ((exitPrice - pick.entryPrice) / pick.entryPrice) * 100;
+    pick.graded = true;
+    pick.outcome = {
       exitPrice,
       movePercent: Math.round(movePercent * 100) / 100,
-      pnl: Math.round(pnl * 100) / 100,
-      result: movePercent >= 50 ? 'BIG_WIN' : movePercent >= 10 ? 'WIN' : movePercent >= 0 ? 'SMALL_WIN' : 'LOSS',
+      result: movePercent >= 20 ? 'WIN' : movePercent >= 0 ? 'SMALL_WIN' : 'LOSS',
       gradedAt: new Date().toISOString(),
       notes: notes || ''
     };
 
     await saveData(data);
-    res.json({ success: true, signal });
+    res.json({ success: true, pick });
   } catch (e) {
     res.status(500).json({ success: false, error: e.message });
   }
 });
 
-// GET accuracy stats
+// Stats
 app.get('/api/stats', async (req, res) => {
   try {
     const data = await loadData();
-    const graded = (data.signals || []).filter(s => s.graded && s.outcome);
+    const graded = (data.picks || []).filter(p => p.graded && p.outcome);
+    if (graded.length === 0) return res.json({ success: true, stats: { totalGraded: 0 } });
 
-    if (graded.length === 0) {
-      return res.json({ success: true, stats: { totalGraded: 0, winRate: 0, avgWin: 0, avgLoss: 0, totalPnl: 0, bySignalType: {} } });
-    }
-
-    const wins = graded.filter(s => s.outcome.movePercent > 0);
-    const losses = graded.filter(s => s.outcome.movePercent <= 0);
-    const bigWins = graded.filter(s => s.outcome.movePercent >= 50);
-
-    const avgWin = wins.length ? wins.reduce((a, s) => a + s.outcome.movePercent, 0) / wins.length : 0;
-    const avgLoss = losses.length ? losses.reduce((a, s) => a + s.outcome.movePercent, 0) / losses.length : 0;
-    const totalPnl = graded.reduce((a, s) => a + s.outcome.pnl, 0);
-
-    // By signal type
-    const bySignalType = {};
-    for (const sig of graded) {
-      for (const trigger of (sig.triggeredSignals || [])) {
-        if (!bySignalType[trigger]) bySignalType[trigger] = { total: 0, wins: 0, pnl: 0 };
-        bySignalType[trigger].total++;
-        if (sig.outcome.movePercent > 0) bySignalType[trigger].wins++;
-        bySignalType[trigger].pnl += sig.outcome.pnl;
-      }
-    }
+    const wins = graded.filter(p => p.outcome.movePercent >= 20);
+    const totalPnl = graded.reduce((sum, p) => {
+      return sum + (p.outcome.movePercent / 100) * 1000;
+    }, 0);
 
     res.json({
       success: true,
       stats: {
         totalGraded: graded.length,
-        totalSignals: (data.signals || []).length,
+        totalPicks: (data.picks || []).length,
         winRate: Math.round((wins.length / graded.length) * 100),
-        bigWinRate: Math.round((bigWins.length / graded.length) * 100),
-        avgWin: Math.round(avgWin * 100) / 100,
-        avgLoss: Math.round(avgLoss * 100) / 100,
-        totalPnl: Math.round(totalPnl * 100) / 100,
-        bySignalType
+        avgMove: Math.round(graded.reduce((s, p) => s + p.outcome.movePercent, 0) / graded.length * 100) / 100,
+        totalPnl: Math.round(totalPnl * 100) / 100
       }
     });
   } catch (e) {
@@ -653,59 +694,50 @@ app.get('/api/stats', async (req, res) => {
   }
 });
 
-// GET history with search
-app.get('/api/history', async (req, res) => {
-  try {
-    const data = await loadData();
-    let signals = data.signals || [];
+// ─── Scheduled Scans ──────────────────────────────────────────────────────────
+// 9:00 AM EST — morning pre-market scan
+// 9:00 PM EST — overnight research scan
 
-    const { ticker, date, catalyst, q } = req.query;
-    if (ticker) signals = signals.filter(s => s.ticker.toUpperCase().includes(ticker.toUpperCase()));
-    if (date) signals = signals.filter(s => s.flaggedAt?.startsWith(date));
-    if (catalyst) signals = signals.filter(s => s.catalystType === catalyst);
-    if (q) {
-      const lower = q.toLowerCase();
-      signals = signals.filter(s =>
-        s.ticker?.toLowerCase().includes(lower) ||
-        s.companyName?.toLowerCase().includes(lower) ||
-        s.filingDescription?.toLowerCase().includes(lower) ||
-        s.catalystType?.toLowerCase().includes(lower)
-      );
-    }
+cron.schedule('0 9 * * 1-5', () => {
+  log('CRON', '9:00 AM scan triggered');
+  runScan();
+}, { timezone: 'America/New_York' });
 
-    res.json({ success: true, count: signals.length, signals });
-  } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
-  }
-});
+cron.schedule('0 21 * * 1-5', () => {
+  log('CRON', '9:00 PM scan triggered');
+  runScan();
+}, { timezone: 'America/New_York' });
 
-// GET last scan info
-app.get('/api/status', async (req, res) => {
-  try {
-    const data = await loadData();
-    const lastScan = (data.scans || [])[0] || null;
-    res.json({ success: true, lastScan, totalSignals: (data.signals || []).length });
-  } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
-  }
-});
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 
-// DELETE signal
-app.delete('/api/signals/:id', async (req, res) => {
-  try {
-    const data = await loadData();
-    data.signals = data.signals.filter(s => s.id !== req.params.id);
-    await saveData(data);
-    res.json({ success: true });
-  } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
-  }
-});
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
 
-// Health check
-app.get('/', (req, res) => res.json({ status: 'Catalyst Scanner running', time: new Date().toISOString() }));
+function getTodayDate() {
+  return new Date().toISOString().split('T')[0];
+}
+
+function getDateDaysAgo(days) {
+  const d = new Date();
+  d.setDate(d.getDate() - days);
+  return d.toISOString().split('T')[0];
+}
+
+function getPrevTradingDay() {
+  const d = new Date();
+  // Go back until we hit a weekday
+  do {
+    d.setDate(d.getDate() - 1);
+  } while (d.getDay() === 0 || d.getDay() === 6);
+  return d.toISOString().split('T')[0];
+}
+
+// ─── Start ────────────────────────────────────────────────────────────────────
 
 app.listen(PORT, () => {
-  console.log(`Catalyst Scanner backend running on port ${PORT}`);
-  console.log('Scheduled scans: 6:00 AM, 9:25 AM, 4:30 PM, 8:00 PM EST (weekdays)');
+  log('START', `Catalyst Scanner v3 running on port ${PORT}`);
+  log('START', `Polygon key: ${POLYGON_KEY ? 'set' : 'MISSING'}`);
+  log('START', 'Scans scheduled: 9:00 AM and 9:00 PM EST weekdays');
+  log('START', 'Diagnostic available at: /api/diagnose');
 });
